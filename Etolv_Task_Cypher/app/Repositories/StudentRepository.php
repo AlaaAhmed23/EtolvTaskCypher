@@ -72,10 +72,9 @@ class StudentRepository implements StudentRepositoryInterface
         if ($result->count() === 0) {
             return null;
         }
-        $record = $result->first();
-        $student = $record->get('student')->toArray();
-        $student['school_id'] = $record->get('school_id');
-        $student['subject_ids'] = $record->get('subject_ids')->toArray();
+        $student = $result->first()->get('student')->toArray();
+        $student['school_id'] = $result->first()->get('school_id');
+        $student['subject_ids'] = $result->first()->get('subject_ids')->toArray();
         return $student;
     }
 
@@ -83,90 +82,66 @@ class StudentRepository implements StudentRepositoryInterface
     {
         $data['school_id'] = (int) $data['school_id'];
         $data['subject_ids'] = array_map('intval', $data['subject_ids']);
-        $id = $this->client->run(
-            'CREATE (s:Student {name: $name}) Return ID(s) as id',
-            [ 'name' => $data['name']] 
-        )->first()->get("id");
-        $id = (int)$id;
-        // Create ENROLLED_IN relationship
-        $this->client->run(
-            'MATCH (s:Student), (school:School) 
-            where ID(s) = $id and ID(school)= $school_id
-            CREATE (s)-[:ENROLLED_IN]->(school)',
+        $result = $this->client->run(
+            'CREATE (s:Student {name: $name})
+             WITH s, $school_id as school_id, $subject_ids as subject_ids
+             MATCH (school:School)
+             WHERE ID(school) = school_id
+             CREATE (s)-[:ENROLLED_IN]->(school)
+             WITH s, subject_ids
+             UNWIND subject_ids as subject_id
+             MATCH (sub:Subject)
+             WHERE ID(sub) = subject_id
+             CREATE (s)-[:STUDIES]->(sub)
+             RETURN ID(s) as id',
             [
-                'id' => $id,
-                'school_id' => $data['school_id']
+                'name' => $data['name'],
+                'school_id' => $data['school_id'],
+                'subject_ids' => !empty($data['subject_ids']) ? $data['subject_ids'] : []
             ]
-            
         );
-        // Create STUDIES relationships
-        if (!empty($data['subject_ids']) && is_array($data['subject_ids'])) {
-                $this->client->run(
-                    'MATCH (s:Student), (sub:Subject )
-                    where ID(s) = $id and ID(sub) in $subject_ids
-                    CREATE (s)-[:STUDIES]->(sub)',
-                    [
-                        'id' => $id,
-                        'subject_ids' => $data['subject_ids']
-                    ]
-                );
-        }
-        return ['id' => $id];
+        
+        return ['id' => (int) $result->first()->get('id')];
     }
-
+    
     public function update(int $id, array $data)
     {
         $id = (int) $id;
         $data['school_id'] = (int) $data['school_id'];        
         $data['subject_ids'] = array_map('intval', $data['subject_ids']);
-        // Update student name
-        $this->client->run(
-            "MATCH (s:Student) WHERE ID(s) = \$id
-            SET s.name = \$name",
-            ['id' => $id, 'name' => (string) $data['name']] 
-        );
-        // Remove old ENROLLED_IN relationship
-        $this->client->run(
-            "MATCH (s:Student)-[r:ENROLLED_IN]->()
-            WHERE ID(s) = \$id
-            DELETE r",
-            ['id' => $id]
-        );
-        // Create new ENROLLED_IN relationship
-        if (!empty($data['school_id'])) {
-            $this->client->run(
-                "MATCH (s:Student), (school:School)
-                WHERE ID(s) = \$studentId AND ID(school) = \$schoolId
-                CREATE (s)-[:ENROLLED_IN]->(school)",
-                [
-                    'studentId' => $id,
-                    'schoolId' => $data['school_id']  
-                ]
-            );
-        }
-        // Remove old STUDIES relationships
-        $this->client->run(
-            "MATCH (s:Student)-[r:STUDIES]->()
-            WHERE ID(s) = \$id
-            DELETE r",
-            ['id' => $id]
-        );
-        // Create new STUDIES relationships
-        if (!empty($data['subject_ids'])) {
-            foreach ($data['subject_ids'] as $subjectId) {
-                $this->client->run(
-                    "MATCH (s:Student), (subject:Subject)
-                    WHERE ID(s) = \$studentId AND ID(subject) = \$subjectId
-                    CREATE (s)-[:STUDIES]->(subject)",
-                    [
-                        'studentId' => $id,
-                        'subjectId' => $subjectId
-                    ]
-                );
-            }
-        }
+
+        $this->client->run("MATCH (s:Student) 
+            WHERE ID(s) = $id
+            SET s.name = \$name
+            WITH s, \$schoolId AS schoolId
+            OPTIONAL MATCH (s)-[oldSchoolRel:ENROLLED_IN]->()
+            DELETE oldSchoolRel
+            WITH s, schoolId
+            WHERE schoolId IS NOT NULL
+            MATCH (school:School)
+            WHERE ID(school) = schoolId
+            MERGE (s)-[:ENROLLED_IN]->(school)
+            
+            WITH s, \$subjectIds AS subjectIds
+            OPTIONAL MATCH (s)-[oldSubjectRel:STUDIES]->()
+            DELETE oldSubjectRel
+            WITH s, subjectIds
+            WHERE size(subjectIds) > 0
+            UNWIND subjectIds AS subjectId
+            MATCH (subject:Subject)
+            WHERE ID(subject) = subjectId
+            // Using MERGE instead of CREATE to prevent duplicates
+            MERGE (s)-[:STUDIES]->(subject)
+            RETURN s, ID(s) AS id", [
+                    'id' => $id,
+                    'name' => (string)$data['name'],
+                    'schoolId' => $data['school_id'],
+                    'subjectIds' => $data['subject_ids']
+                ]);
+       
         return $this->find($id);
     }
+    
     public function delete(int $id)
     {
         return $this->client->run(
